@@ -1,0 +1,1 @@
+export const profileTypeEnum = ["student_profile", "admin_profile", "mentor_profile", "professional_profile"]
