@@ -2,10 +2,73 @@ import { Request } from "express";
 import { AppError } from "../../utils/app_error";
 import { excelConverter } from "../../utils/excel_converter";
 import { isAccountExist } from "../../utils/isAccountExist";
+import { 
+  findFuzzyDuplicatesCollection as findFuzzyDuplicates
+} from "../../utils/mcqDuplicateDetector";
+import { McqBankModel } from "../mcq_bank/mcq_bank.schema";
 import { T_Exam_Professional, T_Exam_Student, TRawMcqRow } from "./exam.interface";
 import { exam_model_professional, exam_model_student } from "./exam.schema";
 
-// for student
+// ─── Shared helpers ───────────────────────────────────────────────────────────
+
+const validateCorrectOption = (
+  correctOption: string,
+  options: { option: string }[]
+) => {
+  const availableLabels = options.map((o) => o.option);
+  if (!availableLabels.includes(correctOption)) {
+    throw new AppError(
+      `correctOption "${correctOption}" is not among the available options: ${availableLabels.join(", ")}`,
+      400
+    );
+  }
+};
+
+const buildMcqUpdateFields = (mcqId: string, updatedQuestionData: Record<string, any>) => {
+  const updateFields: Record<string, any> = {};
+
+  if (updatedQuestionData.question)
+    updateFields["mcqs.$[mcqItem].question"] = updatedQuestionData.question;
+
+  if (updatedQuestionData.imageDescription)
+    updateFields["mcqs.$[mcqItem].imageDescription"] = updatedQuestionData.imageDescription;
+
+  if (updatedQuestionData.correctOption)
+    updateFields["mcqs.$[mcqItem].correctOption"] = updatedQuestionData.correctOption;
+
+  return updateFields;
+};
+
+const buildOptionUpdates = (updatedQuestionData: Record<string, any>) => {
+  const LABELS = ["A", "B", "C", "D", "E", "F"] as const;
+  const arrayFilters: Record<string, any>[] = [];
+  const updateFields: Record<string, any> = {};
+
+  LABELS.forEach((label) => {
+    const textKey = `option${label}`;
+    const expKey = `explanation${label}`;
+    const hasText = updatedQuestionData[textKey] !== undefined;
+    const hasExp = updatedQuestionData[expKey] !== undefined;
+
+    if (hasText || hasExp) {
+      const filterIdentifier = `opt${label.toLowerCase()}`;
+      arrayFilters.push({ [`${filterIdentifier}.option`]: label });
+
+      if (hasText)
+        updateFields[`mcqs.$[mcqItem].options.$[${filterIdentifier}].optionText`] =
+          updatedQuestionData[textKey];
+
+      if (hasExp)
+        updateFields[`mcqs.$[mcqItem].options.$[${filterIdentifier}].explanation`] =
+          updatedQuestionData[expKey];
+    }
+  });
+
+  return { optionUpdateFields: updateFields, arrayFilters };
+};
+
+// ─── Student ──────────────────────────────────────────────────────────────────
+
 const upload_new_student_exam_with_bulk_mcq_into_db = async (req: Request) => {
   const body = req?.body;
   const excelData: any = req.file
@@ -61,15 +124,19 @@ const upload_new_student_exam_with_bulk_mcq_into_db = async (req: Request) => {
     };
   });
 
-  // make payload
+  // validate correctOption against available options for each MCQ
+  refineData.forEach((mcq: any) => {
+    validateCorrectOption(mcq.correctOption, mcq.options);
+  });
+
   const payload: T_Exam_Student = {
     ...body,
     mcqs: refineData,
     totalQuestions: refineData.length,
-  }
+  };
   const result = await exam_model_student.create(payload);
   return result;
-}
+};
 
 const upload_new_student_exam_with_manual_mcq_into_db = async (req: Request) => {
   const body = req?.body;
@@ -80,9 +147,15 @@ const upload_new_student_exam_with_manual_mcq_into_db = async (req: Request) => 
       mcqId: `MCQ-${String(idx + 1).padStart(6, "0")}`,
     };
   });
+
+  // validate correctOption against available options for each MCQ
+  body.mcqs.forEach((mcq: any) => {
+    validateCorrectOption(mcq.correctOption, mcq.options);
+  });
+
   const result = await exam_model_student.create(body);
   return result;
-}
+};
 
 const get_all_student_exam_from_db = async (req: Request) => {
   const { searchTerm, subject, profileType, page, limit } =
@@ -94,7 +167,6 @@ const get_all_student_exam_from_db = async (req: Request) => {
   if (subject) query.subject = subject;
   if (profileType) query.profileType = profileType;
 
-  // make role base for student profile type
   if (req?.user?.role == "STUDENT") {
     const isStudent = await isAccountExist(req?.user?.email as string, "profile_id") as any;
     query.profileType = isStudent?.profile_id?.studentType;
@@ -162,41 +234,32 @@ const update_student_exam_into_db = async (req: Request) => {
 
 const update_student_exam_specific_mcq_into_db = async (req: Request) => {
   const { examId, mcqId } = req?.params as Record<string, string>;
-  const updateFields: Record<string, any> = {};
   const updatedQuestionData = req?.body;
 
-  // Question and image
-  if (updatedQuestionData.question)
-    updateFields["mcqs.$.question"] = updatedQuestionData.question;
+  // validate correctOption against the current stored options before updating
+  if (updatedQuestionData.correctOption) {
+    const exam = await exam_model_student
+      .findOne({ _id: examId, "mcqs.mcqId": mcqId }, { "mcqs.$": 1 })
+      .lean();
+    const currentOptions = exam?.mcqs?.[0]?.options ?? [];
+    validateCorrectOption(updatedQuestionData.correctOption, currentOptions);
+  }
 
-  if (updatedQuestionData.imageDescription)
-    updateFields["mcqs.$.imageDescription"] =
-      updatedQuestionData.imageDescription;
+  const scalarFields = buildMcqUpdateFields(mcqId, updatedQuestionData);
+  const { optionUpdateFields, arrayFilters } = buildOptionUpdates(updatedQuestionData);
 
-  // Options (A–F)
-  const options = ["A", "B", "C", "D", "E", "F"] as const;
-  options.forEach((label, i) => {
-    const textKey = `option${label}` as keyof typeof updatedQuestionData;
-    const expKey = `explanation${label}` as keyof typeof updatedQuestionData;
+  const updateFields = { ...scalarFields, ...optionUpdateFields };
 
-    if (updatedQuestionData[textKey] !== undefined)
-      updateFields[`mcqs.$.options.${i}.optionText`] =
-        updatedQuestionData[textKey];
-
-    if (updatedQuestionData[expKey] !== undefined)
-      updateFields[`mcqs.$.options.${i}.explanation`] =
-        updatedQuestionData[expKey];
-  });
-
-  // Correct Option
-  if (updatedQuestionData.correctOption)
-    updateFields["mcqs.$.correctOption"] = updatedQuestionData.correctOption;
-
-  // Execute the update directly in MongoDB
   const result = await exam_model_student.findOneAndUpdate(
     { _id: examId, "mcqs.mcqId": mcqId },
     { $set: updateFields },
-    { new: true }
+    {
+      new: true,
+      arrayFilters: [
+        { "mcqItem.mcqId": mcqId },
+        ...arrayFilters,
+      ],
+    }
   ).select("-mcqs");
 
   return result;
@@ -211,15 +274,19 @@ const delete_student_exam_from_db = async (req: Request) => {
 const add_more_mcq_into_student_exam_into_db = async (req: Request) => {
   const { id } = req?.params as Record<string, string>;
   const body = req?.body?.mcqs;
-  // find last mcq index
   const existingMcqBank = await exam_model_student.findById(id).select("-mcqs").lean();
   if (!existingMcqBank) throw new AppError("Exam not found", 404);
   const lastMcqIndex = existingMcqBank?.totalQuestions;
 
   const payload = body.map((item: any, idx: number) => ({
     ...item,
-    mcqId: item.mcqId || `MCQ-${String(lastMcqIndex + idx).padStart(6, "0")}`,
+    mcqId: `MCQ-${String(lastMcqIndex + idx + 1).padStart(6, "0")}`,
   }));
+
+  // validate correctOption against available options for each new MCQ
+  payload.forEach((mcq: any) => {
+    validateCorrectOption(mcq.correctOption, mcq.options);
+  });
 
   const result = await exam_model_student.findByIdAndUpdate(
     id,
@@ -245,7 +312,7 @@ const delete_specific_mcq_from_student_exam_from_db = async (req: Request) => {
   return result;
 };
 
-// for professional
+// ─── Professional ─────────────────────────────────────────────────────────────
 
 const upload_new_professional_exam_with_bulk_mcq_into_db = async (req: Request) => {
   const body = req?.body;
@@ -302,15 +369,19 @@ const upload_new_professional_exam_with_bulk_mcq_into_db = async (req: Request) 
     };
   });
 
-  // make payload
+  // validate correctOption against available options for each MCQ
+  refineData.forEach((mcq: any) => {
+    validateCorrectOption(mcq.correctOption, mcq.options);
+  });
+
   const payload: T_Exam_Professional = {
     ...body,
     mcqs: refineData,
     totalQuestions: refineData.length,
-  }
+  };
   const result = await exam_model_professional.create(payload);
   return result;
-}
+};
 
 const upload_new_professional_exam_with_manual_mcq_into_db = async (req: Request) => {
   const body = req?.body;
@@ -321,9 +392,15 @@ const upload_new_professional_exam_with_manual_mcq_into_db = async (req: Request
       mcqId: `MCQ-${String(idx + 1).padStart(6, "0")}`,
     };
   });
+
+  // validate correctOption against available options for each MCQ
+  body.mcqs.forEach((mcq: any) => {
+    validateCorrectOption(mcq.correctOption, mcq.options);
+  });
+
   const result = await exam_model_professional.create(body);
   return result;
-}
+};
 
 const get_all_professional_exam_from_db = async (req: Request) => {
   const { searchTerm, subject, professionName, page, limit } =
@@ -335,7 +412,6 @@ const get_all_professional_exam_from_db = async (req: Request) => {
   if (subject) query.subject = subject;
   if (professionName) query.professionName = professionName;
 
-  // make role base for student profile type
   if (req?.user?.role == "PROFESSIONAL") {
     const isProfessional = await isAccountExist(req?.user?.email as string, "profile_id") as any;
     query.professionName = isProfessional?.profile_id?.professionName;
@@ -374,7 +450,6 @@ const get_single_professional_exam_from_db = async (req: Request) => {
   const total = result?.mcqs?.length || 0;
   const skip = (page - 1) * limit;
 
-  // Pagination after filtering for mcqs
   const paginatedMcqs = result?.mcqs?.slice(skip, skip + limit);
   const meta = {
     page,
@@ -403,41 +478,32 @@ const update_professional_exam_into_db = async (req: Request) => {
 
 const update_professional_exam_specific_mcq_into_db = async (req: Request) => {
   const { examId, mcqId } = req?.params as Record<string, string>;
-  const updateFields: Record<string, any> = {};
   const updatedQuestionData = req?.body;
 
-  // Question and image
-  if (updatedQuestionData.question)
-    updateFields["mcqs.$.question"] = updatedQuestionData.question;
+  // validate correctOption against the current stored options before updating
+  if (updatedQuestionData.correctOption) {
+    const exam = await exam_model_professional
+      .findOne({ _id: examId, "mcqs.mcqId": mcqId }, { "mcqs.$": 1 })
+      .lean();
+    const currentOptions = exam?.mcqs?.[0]?.options ?? [];
+    validateCorrectOption(updatedQuestionData.correctOption, currentOptions);
+  }
 
-  if (updatedQuestionData.imageDescription)
-    updateFields["mcqs.$.imageDescription"] =
-      updatedQuestionData.imageDescription;
+  const scalarFields = buildMcqUpdateFields(mcqId, updatedQuestionData);
+  const { optionUpdateFields, arrayFilters } = buildOptionUpdates(updatedQuestionData);
 
-  // Options (A–F)
-  const options = ["A", "B", "C", "D", "E", "F"] as const;
-  options.forEach((label, i) => {
-    const textKey = `option${label}` as keyof typeof updatedQuestionData;
-    const expKey = `explanation${label}` as keyof typeof updatedQuestionData;
+  const updateFields = { ...scalarFields, ...optionUpdateFields };
 
-    if (updatedQuestionData[textKey] !== undefined)
-      updateFields[`mcqs.$.options.${i}.optionText`] =
-        updatedQuestionData[textKey];
-
-    if (updatedQuestionData[expKey] !== undefined)
-      updateFields[`mcqs.$.options.${i}.explanation`] =
-        updatedQuestionData[expKey];
-  });
-
-  // Correct Option
-  if (updatedQuestionData.correctOption)
-    updateFields["mcqs.$.correctOption"] = updatedQuestionData.correctOption;
-
-  // Execute the update directly in MongoDB
   const result = await exam_model_professional.findOneAndUpdate(
     { _id: examId, "mcqs.mcqId": mcqId },
     { $set: updateFields },
-    { new: true }
+    {
+      new: true,
+      arrayFilters: [
+        { "mcqItem.mcqId": mcqId },
+        ...arrayFilters,
+      ],
+    }
   ).select("-mcqs");
 
   return result;
@@ -452,15 +518,19 @@ const delete_professional_exam_from_db = async (req: Request) => {
 const add_more_mcq_into_professional_exam_into_db = async (req: Request) => {
   const { id } = req?.params as Record<string, string>;
   const body = req?.body?.mcqs;
-  // find last mcq index
   const existingMcqBank = await exam_model_professional.findById(id).select("-mcqs").lean();
   if (!existingMcqBank) throw new AppError("Exam not found", 404);
   const lastMcqIndex = existingMcqBank?.totalQuestions;
 
   const payload = body.map((item: any, idx: number) => ({
     ...item,
-    mcqId: item.mcqId || `MCQ-${String(lastMcqIndex + idx).padStart(6, "0")}`,
+    mcqId: item.mcqId || `MCQ-${String(lastMcqIndex + idx + 1).padStart(6, "0")}`,
   }));
+
+  // validate correctOption against available options for each new MCQ
+  payload.forEach((mcq: any) => {
+    validateCorrectOption(mcq.correctOption, mcq.options);
+  });
 
   const result = await exam_model_professional.findByIdAndUpdate(
     id,
@@ -486,6 +556,63 @@ const delete_specific_mcq_from_professional_exam_from_db = async (req: Request) 
   return result;
 };
 
+// ✅ NEW: Check for duplicate questions in exams
+// ✅ JUST REPLACE THIS ONE FUNCTION - NOTHING ELSE CHANGES
+
+const check_duplicate_question_in_exams = async (req: Request) => {
+  const { question, excludeExamId, examType } = req.body;
+
+  if (!question) {
+    throw new AppError("Question text is required", 400);
+  }
+
+  // Determine which exam model to use
+  const examModel = examType === "professional" 
+    ? exam_model_professional 
+    : exam_model_student;
+
+  // ✅ FIXED: TypeScript errors resolved
+  const allExamsRaw: any[] = await (examModel as any).find({}).lean();
+  const allExams = allExamsRaw
+    .map((exam: any) => ({
+      _id: exam._id,
+      examName: exam.examName || exam.professionName || 'Unknown Exam',
+      mcqs: exam.mcqs || []
+    }))
+    .filter((exam: any) => (exam.mcqs as any[]).length > 0);
+
+  // Fetch all MCQ banks
+  const allBanks = await McqBankModel.find({}).select("_id title mcqs").lean();
+
+  // ✅ FUZZY DUPE DETECTION (85% threshold)
+  const examDuplicates = findFuzzyDuplicates(
+    question,
+    allExams,
+    0.85,
+    5,
+    excludeExamId
+  );
+
+  const bankDuplicates = findFuzzyDuplicates(
+    question,
+    allBanks,
+    0.85,
+    5
+  );
+
+  const allDuplicates = [
+    ...examDuplicates,
+    ...bankDuplicates,
+  ].sort((a, b) => b.similarity - a.similarity);
+
+  return {
+    hasDuplicates: allDuplicates.length > 0,
+    duplicates: allDuplicates,
+    count: allDuplicates.length,
+    bestMatch: allDuplicates[0],
+  };
+};
+
 export const exam_service = {
   // for student
   upload_new_student_exam_with_bulk_mcq_into_db,
@@ -498,7 +625,6 @@ export const exam_service = {
   add_more_mcq_into_student_exam_into_db,
   delete_specific_mcq_from_student_exam_from_db,
 
-
   // for professional
   upload_new_professional_exam_with_bulk_mcq_into_db,
   upload_new_professional_exam_with_manual_mcq_into_db,
@@ -509,4 +635,7 @@ export const exam_service = {
   delete_professional_exam_from_db,
   add_more_mcq_into_professional_exam_into_db,
   delete_specific_mcq_from_professional_exam_from_db,
+  
+  // duplicate check
+  check_duplicate_question_in_exams,
 };

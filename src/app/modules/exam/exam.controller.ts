@@ -150,8 +150,17 @@ const delete_specific_mcq_from_professional_exam = catchAsync(async (req, res, n
   });
 })
 
+const checkDuplicateQuestionInExam = catchAsync(async (req, res, next) => {
+  const result = await exam_service.check_duplicate_question_in_exams(req);
+  res.status(200).json({
+    success: true,
+    message: "Duplicate check completed",
+    data: result
+  });
+})
 
 export const exam_controller = {
+  checkDuplicateQuestionInExam,
   // for student
   upload_new_student_exam_with_bulk_mcq,
   upload_new_student_exam_with_manual_mcq,

@@ -9,11 +9,11 @@ const optionSchema = new Schema(
             required: true,
         },
         optionText: {
-            type: String || Number,
+            type: String,
             required: true,
         },
         explanation: {
-            type: String || Number,
+            type: String,
         },
     },
     { versionKey: false, timestamps: false, _id: false }

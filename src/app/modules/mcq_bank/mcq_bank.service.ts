@@ -4,7 +4,16 @@ import { AppError } from "../../utils/app_error";
 import { excelConverter } from "../../utils/excel_converter";
 import { buildGoalContentFilter } from "../../utils/findContentQueryBuilder";
 import { isAccountExist } from "../../utils/isAccountExist";
+import { 
+  findDuplicatesInCollection,
+  findFuzzyDuplicatesCollection as findFuzzyDuplicates
+} from "../../utils/mcqDuplicateDetector";
+import { 
+  isQualityQuestion,
+  normalizeQuestion 
+} from "../../utils/stringSimilarity";
 import { Account_Model } from "../auth/auth.schema";
+import { exam_model_professional, exam_model_student } from "../exam/exam.schema";
 import { goal_model } from "../goal/goal.schema";
 import { ProfessionalModel } from "../professional/professional.schema";
 import { professional_profile_type_const_model, student_profile_type_const_model } from "../profile_type_const/profile_type_const.schema";
@@ -571,6 +580,86 @@ const upload_existing_mcq_bank_more_questions_into_db = async (
   return result?.modifiedCount;
 };
 
+// ✅ NEW: Check for duplicate questions across all MCQ banks and exams
+const check_duplicate_question = async (req: Request) => {
+  const { question, excludeBankId, contentFor, profileType } = req.body;
+
+  if (!question) {
+    throw new AppError("Question text is required", 400);
+  }
+
+  const inputNorm = normalizeQuestion(question);
+  // Service-level quality check UNDONE - now processes all questions
+  // if (!isQualityQuestion(inputNorm)) {
+  //   return {
+  //     hasDuplicates: false,
+  //     duplicates: [],
+  //     count: 0,
+  //     bestMatch: null,
+  //     reason: 'Low quality question (too short/generic)'
+  //   };
+  // }
+
+  // Build filters
+  const bankFilters: any = {};
+  if (contentFor) bankFilters.contentFor = contentFor;
+  if (profileType) bankFilters.profileType = profileType;
+
+  // Fetch MCQ banks with optional filters
+  const allBanks = await McqBankModel.find(bankFilters).select("_id title mcqs contentFor profileType").lean();
+
+  // Role-based exam filtering (similar to get_all_mcq_banks_public_from_db)
+  let studentExams: any[] = [];
+  let professionalExams: any[] = [];
+  if (req?.user?.role === "STUDENT") {
+    const student = await Student_Model.findOne({ accountId: req?.user?.accountId });
+    studentExams = await exam_model_student.find({ profileType: student?.studentType }).select("_id examName mcqs").lean() as any[];
+  } else if (req?.user?.role === "PROFESSIONAL") {
+    const professional = await ProfessionalModel.findOne({ accountId: req?.user?.accountId });
+    professionalExams = await exam_model_professional.find({ profileType: professional?.professionName }).select("_id examName mcqs").lean() as any[];
+  } else {
+    // Admin/others: fetch all
+    studentExams = await exam_model_student.find({}).select("_id examName mcqs").lean() as any[];
+    professionalExams = await exam_model_professional.find({}).select("_id examName mcqs").lean() as any[];
+  }
+
+  // ✅ FUZZY DUPE DETECTION (uses new defaults: 0.90 threshold, quality skips)
+  const bankDuplicates = findFuzzyDuplicates(
+    question,
+    allBanks,
+    undefined, // use default 0.90
+    5,
+    excludeBankId
+  );
+
+  const studentExamDuplicates = findFuzzyDuplicates(
+    question,
+    studentExams,
+    undefined,
+    5
+  );
+
+  const professionalExamDuplicates = findFuzzyDuplicates(
+    question,
+    professionalExams,
+    undefined,
+    5
+  );
+
+  const allDuplicates = [
+    ...bankDuplicates,
+    ...studentExamDuplicates,
+    ...professionalExamDuplicates,
+  ].sort((a, b) => b.similarity - a.similarity);
+
+  return {
+    hasDuplicates: allDuplicates.length > 0,
+    duplicates: allDuplicates,
+    count: allDuplicates.length,
+    bestMatch: allDuplicates[0] || null,
+  };
+};
+
 export const mcq_bank_service = {
   upload_bulk_mcq_bank_into_db,
   get_all_mcq_banks,
@@ -582,5 +671,6 @@ export const mcq_bank_service = {
   delete_single_mcq_from_db,
   get_specific_mcq_bank_with_index_from_db,
   upload_existing_mcq_bank_more_questions_into_db,
-  get_all_mcq_banks_public_from_db
+  get_all_mcq_banks_public_from_db,
+  check_duplicate_question,
 };

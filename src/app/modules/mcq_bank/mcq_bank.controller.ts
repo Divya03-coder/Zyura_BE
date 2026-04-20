@@ -1,3 +1,4 @@
+import { Request, Response } from "express";
 import catchAsync from "../../utils/catch_async";
 import manageResponse from "../../utils/manage_response";
 import { mcq_bank_service } from "./mcq_bank.service";
@@ -120,6 +121,16 @@ const get_all_mcq_banks_public = catchAsync(async (req, res) => {
         data: result,
     });
 });
+// ✅ NEW: Check duplicate question endpoint
+const check_duplicate = catchAsync(async (req: Request, res: Response) => {
+  const result = await mcq_bank_service.check_duplicate_question(req);
+  manageResponse(res, {
+    statusCode: 200,
+    success: true,
+    message: "Duplicate check completed",
+    data: result,
+  });
+});
 
 export const mcq_bank_controller = {
     upload_bulk_mcq_bank,
@@ -132,5 +143,6 @@ export const mcq_bank_controller = {
     delete_single_mcq,
     get_specific_mcq_bank_with_index,
     upload_existing_mcq_bank_more_questions,
-    get_all_mcq_banks_public
+    get_all_mcq_banks_public,
+    check_duplicate
 };

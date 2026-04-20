@@ -119,4 +119,10 @@ exam_router.delete(
   exam_controller.delete_specific_mcq_from_professional_exam
 );
 
+exam_router.post(
+  "/check-duplicate",
+  auth("ADMIN"),
+  exam_controller.checkDuplicateQuestionInExam
+);
+
 export default exam_router;

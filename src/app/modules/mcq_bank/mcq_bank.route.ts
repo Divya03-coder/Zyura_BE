@@ -5,6 +5,12 @@ import { mcq_bank_controller } from "./mcq_bank.controller";
 
 const mcqBankRouter = Router();
 
+// ✅ NEW: Check duplicate question endpoint
+mcqBankRouter.post(
+  "/check-duplicate",
+  auth("ADMIN", "MENTOR"),
+  mcq_bank_controller.check_duplicate
+);
 
 mcqBankRouter.get(
     "/public-mcq",
