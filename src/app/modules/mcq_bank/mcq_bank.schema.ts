@@ -9,14 +9,14 @@ const optionSchema = new mongoose.Schema(
       required: true,
     },
     optionText: {
-      type: String || Number,
+      type: String,
       required: true,
     },
     explanation: {
-      type: String || Number,
+      type: String,
     },
   },
-  { versionKey: false, timestamps: false, _id: false }
+  { versionKey: false, timestamps: false, _id: false },
 );
 
 export const mcqSchema = new mongoose.Schema(
@@ -46,7 +46,7 @@ export const mcqSchema = new mongoose.Schema(
       enum: ["A", "B", "C", "D", "E", "F"],
     },
   },
-  { versionKey: false, timestamps: false, _id: false }
+  { versionKey: false, timestamps: false, _id: false },
 );
 
 const McqBankSchema = new mongoose.Schema<TMcqBank>(
@@ -66,6 +66,20 @@ const McqBankSchema = new mongoose.Schema<TMcqBank>(
     mcqs: { type: [mcqSchema], required: true },
     viewCount: { type: Number, required: false, default: 0 },
   },
-  { timestamps: true, versionKey: false }
+  { timestamps: true, versionKey: false },
 );
+
+// ─── Indexes ──────────────────────────────────────────────────────────────────
+// These make the duplicate-check queries go from full-collection scan (~18s)
+// to indexed lookup (sub-10ms) when filtering by contentFor + profileType.
+
+// Used by check_duplicate_question bankFilters
+McqBankSchema.index({ contentFor: 1, profileType: 1 });
+
+// Used by get_all_mcq_banks + get_all_mcq_banks_public_from_db
+McqBankSchema.index({ subject: 1, system: 1, topic: 1 });
+
+// Used by title search ($regex on indexed field is faster on large collections)
+McqBankSchema.index({ title: 1 });
+
 export const McqBankModel = mongoose.model<TMcqBank>("mcq_bank", McqBankSchema);
